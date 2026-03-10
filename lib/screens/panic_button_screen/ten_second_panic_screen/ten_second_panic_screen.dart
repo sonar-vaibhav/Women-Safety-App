@@ -1,0 +1,321 @@
+import 'dart:async';
+import 'dart:math';
+import 'package:awesome_ripple_animation/awesome_ripple_animation.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../models/emergency_contact_model.dart';
+import '../../../providers.dart';
+import '../../../services/background/sms_service/sms_sender.dart';
+import '../../../services/sos/unified_sos_service.dart';
+import '../safety_code_screen/safety_code_screen.dart';
+import '../stop_panic_alert_screen/stop_panic_alert_screen.dart';
+import '../../../utils/helpers/timer_util.dart';
+import '../../../utils/logging/logger.dart';
+
+class TenSecondPanicScreen extends ConsumerWidget {
+  const TenSecondPanicScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final userAsyncValue = ref.watch(userStreamProvider);
+    final emergencyContacts = ref.watch(emergencyContactsProvider);
+
+    return userAsyncValue.when(
+      data: (_) => _TenSecondPanicScreenBody(emergencyContacts: emergencyContacts),
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (error, stack) => Center(child: Text('Error: $error')),
+    );
+  }
+}
+
+class _TenSecondPanicScreenBody extends StatefulWidget {
+  final List<EmergencyContact> emergencyContacts;
+
+  const _TenSecondPanicScreenBody({required this.emergencyContacts});
+
+  @override
+  State<_TenSecondPanicScreenBody> createState() => _TenSecondPanicScreenBodyState();
+}
+
+class _TenSecondPanicScreenBodyState extends State<_TenSecondPanicScreenBody> {
+  late Timer _timer;
+  int _countdown = 10;
+  late Position _userLocation;
+  final SMSSender smsSender = SMSSender();
+  late String safetyCode;
+  late String alertId;
+  String? userId;
+
+  @override
+  void initState() {
+    super.initState();
+    _getUserLocation();
+    _startCountdown();
+    safetyCode = _generateSafetyCode();
+    alertId = FirebaseFirestore.instance.collection('alerts').doc().id;
+    _loadUserId();
+  }
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadUserId() async {
+    SharedPreferences pref = await SharedPreferences.getInstance();
+    setState(() {
+      userId = pref.getString("phoneNumber");
+    });
+  }
+
+  void _startCountdown() {
+    _timer = TimerUtil.startCountdown(
+      initialCount: _countdown,
+      onTick: (currentCount) {
+        setState(() => _countdown = currentCount);
+        // Vibration disabled in this build.
+      },
+      onComplete: () async {
+        await _sendAlertAndNavigate();
+      },
+    );
+  }
+
+  Future<void> _getUserLocation() async {
+    _userLocation = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+  }
+
+  Future<void> _sendAlertAndNavigate() async {
+    logger.i('🚨 Panic button countdown completed - triggering SOS');
+    
+    // ═══════════════════════════════════════════════════════════════
+    // USE UNIFIED SOS SERVICE - Same as shake detection
+    // ═══════════════════════════════════════════════════════════════
+    final sosService = UnifiedSOSService();
+    
+    // Convert emergency contacts to the format expected by unified service
+    final contactsList = widget.emergencyContacts.map((contact) {
+      return {
+        'emergency_contact_name': contact.name,
+        'emergency_contact_number': contact.number,
+      };
+    }).toList();
+    
+    // Trigger SOS (includes location, backend, Firebase, and 30-sec recording)
+    final alertId = await sosService.triggerSOS(
+      phoneNumber: userId!,
+      emergencyContacts: contactsList,
+      startRecording: true, // Start 30-second video recording
+    );
+    
+    if (alertId != null) {
+      logger.i('✅ SOS triggered successfully from panic button');
+      
+      // Send SMS to emergency contacts
+      if (widget.emergencyContacts.isNotEmpty) {
+        try {
+          final locationMessage =
+              'SOS Alert! My location: https://maps.google.com/?q=${_userLocation.latitude},${_userLocation.longitude}';
+          final phoneNumbers = widget.emergencyContacts.map((contact) => contact.number).toList();
+          await smsSender.sendAndNavigate(context, locationMessage, phoneNumbers);
+        } catch (e) {
+          logger.e('Failed to send SMS: $e');
+        }
+      }
+      
+      // Navigate to safety code screen
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => SafetyCodeScreen(
+            safetyCode: safetyCode,
+            userId: userId!,
+            alertId: alertId,
+          ),
+        ),
+      );
+    } else {
+      _showSnackBar('Failed to trigger SOS alert');
+    }
+  }
+
+  Future<void> _logAlertToFirestore() async {
+    if (userId == null) {
+      _showSnackBar('User ID not loaded');
+      return;
+    }
+
+    final alertEntry = {
+      'isActive': true,
+      'alert_duration': {'alert_start': Timestamp.now()},
+      'alerted_contacts': widget.emergencyContacts.map((contact) {
+        return {
+          'alerted_contact_name': contact.name,
+          'alerted_contact_number': contact.number,
+        };
+      }).toList(),
+      'type': 'panic',
+      'safety_code': safetyCode,
+      'user_locations': {
+        'user_location_start': GeoPoint(_userLocation.latitude, _userLocation.longitude),
+        'user_location_end': GeoPoint(_userLocation.latitude, _userLocation.longitude),
+      },
+    };
+
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(userId)  // Use the loaded userId here
+        .collection('alerts')
+        .doc(alertId)
+        .set(alertEntry); // Use set to create the document
+
+    print('Alert created with alert_id: $alertId');
+  }
+
+  String _generateSafetyCode() {
+    // Generate 4-digit alphanumeric code
+    const String chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    String code = '';
+    final random = Random();
+    
+    for (int i = 0; i < 4; i++) {
+      code += chars[random.nextInt(chars.length)];
+    }
+    
+    return code;
+  }
+
+  void _showSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Column(
+          children: [
+            const SizedBox(height: 140),
+            RippleAnimation(
+              key: UniqueKey(),
+              repeat: true,
+              duration: const Duration(milliseconds: 900),
+              ripplesCount: 10,
+              color: const Color(0xFFF8BDBB),
+              minRadius: 100,
+              size: const Size(170, 170),
+              child: CircleAvatar(
+                radius: 50,
+                backgroundColor: const Color(0xFFEC4A46),
+                child: Text(
+                  '$_countdown',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 80,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 100),
+            const Text(
+              'KEEP CALM!',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'Poppins',
+                color: Color(0xFFD20451),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: RichText(
+                textAlign: TextAlign.center,
+                text: const TextSpan(
+                  text: 'Within ',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: 'Poppins',
+                    color: Colors.black,
+                  ),
+                  children: <TextSpan>[
+                    TextSpan(
+                      text: '10 seconds,',
+                      style: TextStyle(
+                        color: Colors.red,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    TextSpan(
+                      text: ' your ',
+                    ),
+                    TextSpan(
+                      text: 'close contacts',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    TextSpan(
+                      text: ' will be alerted of your whereabouts.',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 60),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 20),
+              child: Text(
+                'Press the button below to stop SOS alert.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  fontFamily: 'Poppins',
+                ),
+              ),
+            ),
+            const Spacer(),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 50),
+              child: ElevatedButton(
+                onPressed: () {
+                  _timer.cancel();
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const StopPanicAlertScreen(),
+                    ),
+                  );
+                },
+                style: ElevatedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  backgroundColor: const Color(0xFFD20452),
+                  minimumSize: const Size(200, 70),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(50),
+                  ),
+                ),
+                child: const Text(
+                  'STOP SENDING SOS ALERT',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'Poppins',
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

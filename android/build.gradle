@@ -1,0 +1,42 @@
+buildscript {
+    ext.kotlin_version = '2.1.0'
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+        classpath 'com.google.gms:google-services:4.4.2'
+    }
+
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+// Relax -Werror for all Java compilation tasks in subprojects (e.g. just_audio)
+// so that Java 8 deprecation warnings do not fail the build.
+gradle.projectsEvaluated {
+    subprojects { proj ->
+        proj.tasks.withType(JavaCompile).configureEach { JavaCompile task ->
+            task.options.compilerArgs.removeAll { it == "-Werror" }
+        }
+    }
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
